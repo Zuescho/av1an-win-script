@@ -1,0 +1,310 @@
+<#
+.SYNOPSIS
+    AV1 Encoder & MKV Muxing Tool (PowerShell v20 - Clean Code)
+    
+    Fixes:
+    - Renamed functions to use approved verbs (Disable-SystemSleep, Enable-SystemSleep).
+    - Removed unused variable assignment ($PowerMgr).
+    - Maintains all features (Wire Mode, Animation Mode, Audio Only, etc).
+#>
+
+# ==================================================
+# 1. ANTI-SLEEP MECHANISM
+# ==================================================
+$SleepCode = @"
+    [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    public static extern int SetThreadExecutionState(int esFlags);
+"@
+
+# FIX: Removed unused '$PowerMgr =' assignment. Just loading the type.
+try {
+    Add-Type -MemberDefinition $SleepCode -Name "Win32" -Namespace Win32 -PassThru -ErrorAction Stop | Out-Null
+} catch { }
+
+# FIX: Renamed to official Verbs (Disable/Enable)
+function Disable-SystemSleep {
+    $null = [Win32.Win32]::SetThreadExecutionState(0x80000001)
+    Write-Host "Auto-Sleep disabled." -ForegroundColor DarkGray
+}
+
+function Enable-SystemSleep {
+    $null = [Win32.Win32]::SetThreadExecutionState(0x80000000) 
+}
+
+# ==================================================
+# 2. DEFAULT PARAMETERS
+# ==================================================
+$Params = [Ordered]@{
+    "Preset"          = "4"
+    "CRF"             = "24"
+    "Target Quality"  = "80"
+    "Film Grain"      = "0"
+    "Keyint"          = "240"
+    "Workers"         = "3"
+    "Audio"           = "-c:a copy"
+}
+
+# ==================================================
+# SETUP PATHS
+# ==================================================
+$ScriptDir = $PSScriptRoot
+Set-Location -Path $ScriptDir
+$DepPath = Resolve-Path "$ScriptDir\..\..\dependencies" -ErrorAction SilentlyContinue
+
+if ($DepPath -and (Test-Path $DepPath)) {
+    $Env:PATH = "$DepPath;$Env:PATH"
+    Get-ChildItem -Path $DepPath -Directory | ForEach-Object { $Env:PATH = "$($_.FullName);$Env:PATH" }
+}
+
+$VsPath = "$DepPath\vapoursynth64\Lib\site-packages"
+if (Test-Path $VsPath) { $Env:PATH = "$VsPath;$Env:PATH" }
+
+$CompletedPath = "$ScriptDir\input\completed-inputs"
+$OutputDir     = "$ScriptDir\output"
+if (-not (Test-Path $CompletedPath)) { New-Item -ItemType Directory -Force -Path $CompletedPath | Out-Null }
+if (-not (Test-Path $OutputDir))     { New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null }
+
+# ==================================================
+# HELPER FUNCTIONS
+# ==================================================
+function Get-FilesRecursive {
+    param ($Path)
+    Get-ChildItem -Path $Path -Recurse -Include *.webm,*.mp4,*.mkv,*.mov,*.avi,*.ts,*.m2t,*.m2ts | 
+    Where-Object { $_.FullName -notmatch "completed-inputs" }
+}
+
+function Get-SmartName {
+    param ($FileName, $QueueNum, $AudioOnly = $false)
+    
+    if ($AudioOnly) {
+        $NewName = $FileName -replace "DTS-HD.MA.5.1","Opus" -replace "DTS","Opus" -replace "AC3","Opus" -replace "DD","Opus"
+        if ($NewName -notmatch "Opus") { $NewName = "$NewName [Opus]" }
+    } else {
+        $NewName = $FileName -replace "x264","AV1" -replace "h264","AV1" -replace "H.264","AV1" `
+                             -replace "AVC","AV1" -replace "HEVC","AV1" -replace "x265","AV1" `
+                             -replace "DTS-HD.MA.5.1","Opus" -replace "DTS","Opus" `
+                             -replace "AC3","Opus" -replace "DD","Opus"
+        if ($NewName -notmatch "AV1") { $NewName = "$NewName [AV1]" }
+    }
+    
+    $FinalName = "$NewName.mkv"
+    if (Test-Path "$OutputDir\$FinalName") { $FinalName = "${NewName}_${QueueNum}.mkv" }
+    return $FinalName
+}
+
+function Show-ParamEditor {
+    while ($true) {
+        Clear-Host
+        Write-Host "==================================================" -ForegroundColor Yellow
+        Write-Host "         CONFIGURE ENCODER PARAMETERS"
+        Write-Host "=================================================="
+        $i = 1
+        foreach ($Key in $Params.Keys) {
+            Write-Host "[$i] $Key".PadRight(20) + ": " -NoNewline
+            Write-Host $Params[$Key] -ForegroundColor Cyan
+            $i++
+        }
+        Write-Host "`n[D] Done`n"
+        $Selection = Read-Host "Select # to edit"
+        if ($Selection -eq "D" -or $Selection -eq "d") { break }
+        if ($Selection -match "^\d+$" -and $Selection -le $Params.Count) {
+            $Keys = @($Params.Keys)
+            $KeyToEdit = $Keys[$Selection - 1]
+            Write-Host "Editing $KeyToEdit (Current: $($Params[$KeyToEdit]))" -ForegroundColor Yellow
+            $NewVal = Read-Host "Enter new value"
+            if (-not [string]::IsNullOrWhiteSpace($NewVal)) { $Params[$KeyToEdit] = $NewVal }
+        }
+    }
+}
+
+# ==================================================
+# MAIN EXECUTION
+# ==================================================
+try {
+    while ($true) {
+        Clear-Host
+        $InputFiles = @(Get-FilesRecursive "input")
+        $Count = $InputFiles.Count
+
+        Write-Host "==================================================" -ForegroundColor Cyan
+        Write-Host "       AV1 ENCODER & MKV TOOL (PowerShell)" -ForegroundColor Cyan
+        Write-Host "=================================================="
+        Write-Host "Files found: $Count"
+        Write-Host ""
+        Write-Host "[1] ENCODE STANDARD (CRF)"
+        Write-Host "[2] ENCODE HIGH EFFICIENCY (SSIMULACRA2)"
+        Write-Host "[3] MUXING TOOL (Remux, Sync Fix, No Encode)"
+        Write-Host "[4] 'THE WIRE' SPECIAL (Video + Audio)"
+        Write-Host "[5] AUDIO CONVERT ONLY (Opus Stereo)"
+        Write-Host "[6] 2D ANIMATION SPECIAL (Cartoon)"
+        Write-Host ""
+        Write-Host "[P] CHANGE PARAMETERS"
+        Write-Host "[Q] Quit"
+        Write-Host ""
+
+        $Choice = Read-Host "Selection"
+        if ($Choice -eq "Q" -or $Choice -eq "q") { break }
+        if ($Choice -eq "P" -or $Choice -eq "p") { Show-ParamEditor }
+
+        # --- SHUTDOWN LOGIC ---
+        if ($Choice -match "[1,2,4,5,6]") {
+            if ($Count -eq 0) { Write-Host "No files found!"; Pause; continue }
+            $ShutdownAns = Read-Host "`nShutdown PC after finishing? (Y/N)"
+            $DoShutdown = ($ShutdownAns -eq "Y" -or $ShutdownAns -eq "y")
+            Disable-SystemSleep
+        }
+
+        # ------------------------------------
+        # MODE 1: STANDARD
+        # ------------------------------------
+        if ($Choice -eq "1") {
+            $Queue = 1
+            foreach ($File in $InputFiles) {
+                $OutputName = Get-SmartName -FileName $File.BaseName -QueueNum $Queue
+                Write-Host "Processing File $Queue of $Count (CRF)" -ForegroundColor Green
+                $Av1anArgs = @("-i", $File.FullName, "-o", "$OutputDir\$OutputName", "-e", "svt-av1", "-y", "--resume", "--verbose", "-c", "mkvmerge", "-m", "ffms2", "-w", $Params['Workers'], "-a", $Params['Audio'], "-v", "--keyint $($Params['Keyint']) --preset $($Params['Preset']) --crf $($Params['CRF']) --film-grain $($Params['Film Grain'])")
+                & av1an $Av1anArgs
+                if ($LASTEXITCODE -eq 0) { Move-Item -LiteralPath $File.FullName -Destination $CompletedPath -Force }
+                $Queue++
+            }
+        }
+        # ------------------------------------
+        # MODE 2: SSIMULACRA2
+        # ------------------------------------
+        elseif ($Choice -eq "2") {
+            $Queue = 1
+            foreach ($File in $InputFiles) {
+                $OutputName = Get-SmartName -FileName $File.BaseName -QueueNum $Queue
+                Write-Host "Processing File $Queue of $Count (SSIMULACRA2)" -ForegroundColor Magenta
+                $Av1anArgs = @("-i", $File.FullName, "-o", "$OutputDir\$OutputName", "-e", "svt-av1", "-y", "--resume", "--verbose", "-c", "mkvmerge", "-m", "ffms2", "-w", $Params['Workers'], "-a", $Params['Audio'], "--target-metric", "ssimulacra2", "--target-quality", $Params['Target Quality'], "-v", "--keyint $($Params['Keyint']) --preset $($Params['Preset']) --film-grain $($Params['Film Grain'])")
+                & av1an $Av1anArgs
+                if ($LASTEXITCODE -eq 0) { Move-Item -LiteralPath $File.FullName -Destination $CompletedPath -Force }
+                $Queue++
+            }
+        }
+        # ------------------------------------
+        # MODE 3: MUXING TOOL
+        # ------------------------------------
+        elseif ($Choice -eq "3") {
+            if ($Count -eq 0) { Write-Host "No files found!"; Pause; continue }
+
+            $FirstFile = $InputFiles[0].FullName
+            Write-Host "`nScanning template file: $($InputFiles[0].Name)" -ForegroundColor Yellow
+            $JsonInfo = mkvmerge -J $FirstFile | ConvertFrom-Json
+            
+            $AudioTracks = $JsonInfo.tracks | Where-Object { $_.type -eq "audio" }
+            Write-Host "`n--- AUDIO TRACKS ---" -ForegroundColor Cyan
+            if ($AudioTracks) {
+                foreach ($t in $AudioTracks) { Write-Host "ID: $($t.id)".PadRight(10) + "| Lang: $($t.properties.language)".PadRight(15) + "| Codec: $($t.codec)" }
+                $KeepAudio = Read-Host "`nEnter Audio IDs to KEEP (e.g. '0,1' or 'All')"
+            }
+
+            $SubTracks = $JsonInfo.tracks | Where-Object { $_.type -eq "subtitles" }
+            Write-Host "`n--- SUBTITLE TRACKS ---" -ForegroundColor Cyan
+            if ($SubTracks) {
+                foreach ($t in $SubTracks) { 
+                    $TName = if ($t.properties.track_name) { $t.properties.track_name } else { "No Name" }
+                    Write-Host "ID: $($t.id)".PadRight(10) + "| Lang: $($t.properties.language)".PadRight(15) + "| Name: $TName"
+                }
+                $KeepSubs = Read-Host "`nEnter Subtitle IDs to KEEP (e.g. '2' or 'All')"
+            }
+            
+            $DelayMs = Read-Host "`nEnter Subtitle Delay in ms (e.g. 200 to delay, -200 to speed up)"
+
+            foreach ($File in $InputFiles) {
+                $OutputName = $File.BaseName + " [Muxed].mkv"
+                $OutPath = "$OutputDir\$OutputName"
+                Write-Host "Muxing: $($File.Name)" -ForegroundColor Green
+                
+                $CmdArgs = @("-o", $OutPath)
+                if ($KeepAudio -ne "All" -and $KeepAudio -ne "" -and $KeepAudio -ne "A") { $CmdArgs += "--audio-tracks"; $CmdArgs += $KeepAudio }
+                
+                if ($KeepSubs -eq "None") { 
+                    $CmdArgs += "--no-subtitles" 
+                } elseif ($KeepSubs -ne "All" -and $KeepSubs -ne "" -and $KeepSubs -ne "A") { 
+                    $CmdArgs += "--subtitle-tracks"; $CmdArgs += $KeepSubs 
+                }
+
+                if ($DelayMs -match "^-?\d+$" -and $DelayMs -ne "0") {
+                    if ($KeepSubs -ne "All" -and $KeepSubs -ne "A" -and $KeepSubs -ne "") {
+                        $SubList = $KeepSubs -split ","
+                        foreach ($sid in $SubList) { $CmdArgs += "--sync"; $CmdArgs += "$($sid):$DelayMs" }
+                    } else {
+                        foreach ($t in $SubTracks) { $CmdArgs += "--sync"; $CmdArgs += "$($t.id):$DelayMs" }
+                    }
+                }
+
+                $CmdArgs += $File.FullName
+                & mkvmerge $CmdArgs | Out-Null
+                if ($LASTEXITCODE -eq 0) { Move-Item -LiteralPath $File.FullName -Destination $CompletedPath -Force }
+            }
+        }
+        # ------------------------------------
+        # MODE 4: THE WIRE (FULL VIDEO)
+        # ------------------------------------
+        elseif ($Choice -eq "4") {
+            $Queue = 1
+            foreach ($File in $InputFiles) {
+                $OutputName = Get-SmartName -FileName $File.BaseName -QueueNum $Queue
+                Write-Host "Processing File $Queue of $Count (The Wire)" -ForegroundColor Yellow
+                $AudioCmd = "-c:a libopus -b:a 128k -ac 2 -af `"aresample=matrix_encoding=dplii`""
+                $Av1anArgs = @("-i", $File.FullName, "-o", "$OutputDir\$OutputName", "-e", "svt-av1", "-y", "--resume", "--verbose", "-c", "mkvmerge", "-m", "ffms2", "-w", "2", "-a", $AudioCmd, "-v", "--keyint 240 --preset 4 --crf 27 --film-grain 12")
+                & av1an $Av1anArgs
+                if ($LASTEXITCODE -eq 0) { Move-Item -LiteralPath $File.FullName -Destination $CompletedPath -Force }
+                $Queue++
+            }
+        }
+        # ------------------------------------
+        # MODE 5: AUDIO CONVERT ONLY
+        # ------------------------------------
+        elseif ($Choice -eq "5") {
+            $Queue = 1
+            foreach ($File in $InputFiles) {
+                $OutputName = Get-SmartName -FileName $File.BaseName -QueueNum $Queue -AudioOnly $true
+                Write-Host "-----------------------------------" -ForegroundColor Cyan
+                Write-Host " Processing File $Queue of $Count (Audio Only)"
+                Write-Host " Input:  $($File.Name)"
+                Write-Host " Output: $OutputName"
+                Write-Host "-----------------------------------"
+                $FFArgs = @("-y", "-i", $File.FullName, "-map", "0", "-c:v", "copy", "-c:s", "copy", "-c:a", "libopus", "-b:a", "128k", "-ac", "2", "-af", "aresample=matrix_encoding=dplii", "-metadata:s:a", "title=", "$OutputDir\$OutputName")
+                & ffmpeg $FFArgs
+                if ($LASTEXITCODE -eq 0) { Move-Item -LiteralPath $File.FullName -Destination $CompletedPath -Force } else { Write-Host "Conversion failed!" -ForegroundColor Red; Pause; break }
+                $Queue++
+            }
+        }
+        # ------------------------------------
+        # MODE 6: 2D ANIMATION SPECIAL
+        # ------------------------------------
+        elseif ($Choice -eq "6") {
+            $Queue = 1
+            foreach ($File in $InputFiles) {
+                $OutputName = Get-SmartName -FileName $File.BaseName -QueueNum $Queue
+                Write-Host "-----------------------------------" -ForegroundColor Yellow
+                Write-Host " Processing File $Queue of $Count (Mode: CARTOON)"
+                Write-Host " Input:  $($File.Name)"
+                Write-Host " Output: $OutputName"
+                Write-Host "-----------------------------------"
+                $AudioCmd = "-c:a libopus -b:a 96k -ac 2"
+                $Av1anArgs = @("-i", $File.FullName, "-o", "$OutputDir\$OutputName", "-e", "svt-av1", "-y", "--resume", "--verbose", "-c", "mkvmerge", "-m", "ffms2", "-w", $Params['Workers'], "-a", $AudioCmd, "-v", "--keyint 240 --preset 6 --crf 30 --film-grain 0")
+                & av1an $Av1anArgs
+                if ($LASTEXITCODE -eq 0) { Move-Item -LiteralPath $File.FullName -Destination $CompletedPath -Force } else { Write-Host "Encoding failed!" -ForegroundColor Red; Pause; break }
+                $Queue++
+            }
+        }
+
+        # --- SHUTDOWN CHECK ---
+        if ($Choice -match "[1,2,4,5,6]") {
+            Enable-SystemSleep
+            if ($DoShutdown) {
+                Write-Host "`nSHUTTING DOWN IN 60 SECONDS (CTRL+C to Cancel)." -ForegroundColor Red
+                Start-Sleep -Seconds 60
+                Stop-Computer -Force
+            } else {
+                Write-Host "`nBatch Completed." -ForegroundColor Cyan
+                Pause
+            }
+        }
+    }
+} finally {
+    Enable-SystemSleep
+}
