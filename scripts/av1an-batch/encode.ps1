@@ -1,11 +1,11 @@
 <#
 .SYNOPSIS
-    AV1 Encoder & MKV Muxing Tool (PowerShell v20 - Clean Code)
+    AV1 Encoder & MKV Muxing Tool (PowerShell v23 - Preview Generator)
     
-    Fixes:
-    - Renamed functions to use approved verbs (Disable-SystemSleep, Enable-SystemSleep).
-    - Removed unused variable assignment ($PowerMgr).
-    - Maintains all features (Wire Mode, Animation Mode, Audio Only, etc).
+    New Feature:
+    - Mode 8: "GENERATE PREVIEWS".
+      - Creates 3x 30-second clips (Start, Middle, End) from the selected file.
+      - Allows you to test if your Grain/CRF settings look good before committing to the full encode.
 #>
 
 # ==================================================
@@ -16,12 +16,10 @@ $SleepCode = @"
     public static extern int SetThreadExecutionState(int esFlags);
 "@
 
-# FIX: Removed unused '$PowerMgr =' assignment. Just loading the type.
 try {
     Add-Type -MemberDefinition $SleepCode -Name "Win32" -Namespace Win32 -PassThru -ErrorAction Stop | Out-Null
 } catch { }
 
-# FIX: Renamed to official Verbs (Disable/Enable)
 function Disable-SystemSleep {
     $null = [Win32.Win32]::SetThreadExecutionState(0x80000001)
     Write-Host "Auto-Sleep disabled." -ForegroundColor DarkGray
@@ -137,6 +135,9 @@ try {
         Write-Host "[4] 'THE WIRE' SPECIAL (Video + Audio)"
         Write-Host "[5] AUDIO CONVERT ONLY (Opus Stereo)"
         Write-Host "[6] 2D ANIMATION SPECIAL (Cartoon)"
+        Write-Host "[7] 'THE SOPRANOS' SPECIAL (35mm Drama)"
+        Write-Host "[8] GENERATE PREVIEWS (Test Settings)"
+        Write-Host "    (Creates 3x 30s clips to check quality)"
         Write-Host ""
         Write-Host "[P] CHANGE PARAMETERS"
         Write-Host "[Q] Quit"
@@ -147,7 +148,7 @@ try {
         if ($Choice -eq "P" -or $Choice -eq "p") { Show-ParamEditor }
 
         # --- SHUTDOWN LOGIC ---
-        if ($Choice -match "[1,2,4,5,6]") {
+        if ($Choice -match "[1,2,4,5,6,7]") {
             if ($Count -eq 0) { Write-Host "No files found!"; Pause; continue }
             $ShutdownAns = Read-Host "`nShutdown PC after finishing? (Y/N)"
             $DoShutdown = ($ShutdownAns -eq "Y" -or $ShutdownAns -eq "y")
@@ -183,22 +184,19 @@ try {
             }
         }
         # ------------------------------------
-        # MODE 3: MUXING TOOL
+        # MODE 3: MUXING TOOL (SYNC FIX)
         # ------------------------------------
         elseif ($Choice -eq "3") {
             if ($Count -eq 0) { Write-Host "No files found!"; Pause; continue }
-
             $FirstFile = $InputFiles[0].FullName
             Write-Host "`nScanning template file: $($InputFiles[0].Name)" -ForegroundColor Yellow
             $JsonInfo = mkvmerge -J $FirstFile | ConvertFrom-Json
-            
             $AudioTracks = $JsonInfo.tracks | Where-Object { $_.type -eq "audio" }
             Write-Host "`n--- AUDIO TRACKS ---" -ForegroundColor Cyan
             if ($AudioTracks) {
                 foreach ($t in $AudioTracks) { Write-Host "ID: $($t.id)".PadRight(10) + "| Lang: $($t.properties.language)".PadRight(15) + "| Codec: $($t.codec)" }
                 $KeepAudio = Read-Host "`nEnter Audio IDs to KEEP (e.g. '0,1' or 'All')"
             }
-
             $SubTracks = $JsonInfo.tracks | Where-Object { $_.type -eq "subtitles" }
             Write-Host "`n--- SUBTITLE TRACKS ---" -ForegroundColor Cyan
             if ($SubTracks) {
@@ -208,32 +206,20 @@ try {
                 }
                 $KeepSubs = Read-Host "`nEnter Subtitle IDs to KEEP (e.g. '2' or 'All')"
             }
-            
             $DelayMs = Read-Host "`nEnter Subtitle Delay in ms (e.g. 200 to delay, -200 to speed up)"
-
             foreach ($File in $InputFiles) {
                 $OutputName = $File.BaseName + " [Muxed].mkv"
                 $OutPath = "$OutputDir\$OutputName"
                 Write-Host "Muxing: $($File.Name)" -ForegroundColor Green
-                
                 $CmdArgs = @("-o", $OutPath)
                 if ($KeepAudio -ne "All" -and $KeepAudio -ne "" -and $KeepAudio -ne "A") { $CmdArgs += "--audio-tracks"; $CmdArgs += $KeepAudio }
-                
-                if ($KeepSubs -eq "None") { 
-                    $CmdArgs += "--no-subtitles" 
-                } elseif ($KeepSubs -ne "All" -and $KeepSubs -ne "" -and $KeepSubs -ne "A") { 
-                    $CmdArgs += "--subtitle-tracks"; $CmdArgs += $KeepSubs 
-                }
-
+                if ($KeepSubs -eq "None") { $CmdArgs += "--no-subtitles" } elseif ($KeepSubs -ne "All" -and $KeepSubs -ne "" -and $KeepSubs -ne "A") { $CmdArgs += "--subtitle-tracks"; $CmdArgs += $KeepSubs }
                 if ($DelayMs -match "^-?\d+$" -and $DelayMs -ne "0") {
                     if ($KeepSubs -ne "All" -and $KeepSubs -ne "A" -and $KeepSubs -ne "") {
                         $SubList = $KeepSubs -split ","
                         foreach ($sid in $SubList) { $CmdArgs += "--sync"; $CmdArgs += "$($sid):$DelayMs" }
-                    } else {
-                        foreach ($t in $SubTracks) { $CmdArgs += "--sync"; $CmdArgs += "$($t.id):$DelayMs" }
-                    }
+                    } else { foreach ($t in $SubTracks) { $CmdArgs += "--sync"; $CmdArgs += "$($t.id):$DelayMs" } }
                 }
-
                 $CmdArgs += $File.FullName
                 & mkvmerge $CmdArgs | Out-Null
                 if ($LASTEXITCODE -eq 0) { Move-Item -LiteralPath $File.FullName -Destination $CompletedPath -Force }
@@ -261,11 +247,7 @@ try {
             $Queue = 1
             foreach ($File in $InputFiles) {
                 $OutputName = Get-SmartName -FileName $File.BaseName -QueueNum $Queue -AudioOnly $true
-                Write-Host "-----------------------------------" -ForegroundColor Cyan
-                Write-Host " Processing File $Queue of $Count (Audio Only)"
-                Write-Host " Input:  $($File.Name)"
-                Write-Host " Output: $OutputName"
-                Write-Host "-----------------------------------"
+                Write-Host "Processing File $Queue of $Count (Audio Only)" -ForegroundColor Cyan
                 $FFArgs = @("-y", "-i", $File.FullName, "-map", "0", "-c:v", "copy", "-c:s", "copy", "-c:a", "libopus", "-b:a", "128k", "-ac", "2", "-af", "aresample=matrix_encoding=dplii", "-metadata:s:a", "title=", "$OutputDir\$OutputName")
                 & ffmpeg $FFArgs
                 if ($LASTEXITCODE -eq 0) { Move-Item -LiteralPath $File.FullName -Destination $CompletedPath -Force } else { Write-Host "Conversion failed!" -ForegroundColor Red; Pause; break }
@@ -279,11 +261,7 @@ try {
             $Queue = 1
             foreach ($File in $InputFiles) {
                 $OutputName = Get-SmartName -FileName $File.BaseName -QueueNum $Queue
-                Write-Host "-----------------------------------" -ForegroundColor Yellow
-                Write-Host " Processing File $Queue of $Count (Mode: CARTOON)"
-                Write-Host " Input:  $($File.Name)"
-                Write-Host " Output: $OutputName"
-                Write-Host "-----------------------------------"
+                Write-Host "Processing File $Queue of $Count (Mode: CARTOON)" -ForegroundColor Yellow
                 $AudioCmd = "-c:a libopus -b:a 96k -ac 2"
                 $Av1anArgs = @("-i", $File.FullName, "-o", "$OutputDir\$OutputName", "-e", "svt-av1", "-y", "--resume", "--verbose", "-c", "mkvmerge", "-m", "ffms2", "-w", $Params['Workers'], "-a", $AudioCmd, "-v", "--keyint 240 --preset 6 --crf 30 --film-grain 0")
                 & av1an $Av1anArgs
@@ -291,9 +269,69 @@ try {
                 $Queue++
             }
         }
+        # ------------------------------------
+        # MODE 7: THE SOPRANOS SPECIAL
+        # ------------------------------------
+        elseif ($Choice -eq "7") {
+            $Queue = 1
+            foreach ($File in $InputFiles) {
+                $OutputName = Get-SmartName -FileName $File.BaseName -QueueNum $Queue
+                Write-Host "Processing File $Queue of $Count (Mode: SOPRANOS)" -ForegroundColor Yellow
+                $AudioCmd = "-c:a libopus -b:a 128k -ac 2 -af `"aresample=matrix_encoding=dplii`""
+                $Av1anArgs = @("-i", $File.FullName, "-o", "$OutputDir\$OutputName", "-e", "svt-av1", "-y", "--resume", "--verbose", "-c", "mkvmerge", "-m", "ffms2", "-w", $Params['Workers'], "-a", $AudioCmd, "-v", "--keyint 240 --preset 4 --crf 25 --film-grain 10")
+                & av1an $Av1anArgs
+                if ($LASTEXITCODE -eq 0) { Move-Item -LiteralPath $File.FullName -Destination $CompletedPath -Force } else { Write-Host "Encoding failed!" -ForegroundColor Red; Pause; break }
+                $Queue++
+            }
+        }
+        # ------------------------------------
+        # MODE 8: GENERATE PREVIEWS
+        # ------------------------------------
+        elseif ($Choice -eq "8") {
+            if ($Count -eq 0) { Write-Host "No files found!"; Pause; continue }
+            
+            # Ask which settings to use for the test
+            Write-Host "`n--- PREVIEW SETTINGS ---" -ForegroundColor Yellow
+            $TestCRF   = Read-Host "Enter CRF to test (Default: 24)"
+            if ($TestCRF -eq "") { $TestCRF = "24" }
+            $TestGrain = Read-Host "Enter Film Grain to test (Default: 0)"
+            if ($TestGrain -eq "") { $TestGrain = "0" }
+            $TestPreset = Read-Host "Enter Preset (Default: 6)"
+            if ($TestPreset -eq "") { $TestPreset = "6" }
+
+            $Queue = 1
+            foreach ($File in $InputFiles) {
+                # We only process the FIRST file in the list for previews to save time,
+                # unless you want to loop all. usually 1 is enough to test settings.
+                Write-Host "Generating Previews for: $($File.Name)" -ForegroundColor Cyan
+                
+                # Define 3 timestamps: Start (00:02:00), Middle, End
+                $Timestamps = @("00:02:00", "00:20:00", "00:40:00")
+                $Index = 1
+
+                foreach ($Time in $Timestamps) {
+                    $PrevName = "PREVIEW_${Index}_" + $File.BaseName + ".mkv"
+                    Write-Host "  -> Clip $Index ($Time)..." -ForegroundColor DarkGray
+                    
+                    # FFmpeg command to cut 30s and encode immediately using SVT-AV1 via ffmpeg directly (faster for previews)
+                    # Note: We use FFmpeg libsvtav1 here for speed/simplicity in preview mode.
+                    $FFArgs = @(
+                        "-y", "-ss", $Time, "-t", "30", "-i", $File.FullName,
+                        "-c:v", "libsvtav1", "-preset", $TestPreset, "-crf", $TestCRF, "-svtav1-params", "film-grain=$TestGrain",
+                        "-c:a", "libopus", "-b:a", "96k",
+                        "$OutputDir\$PrevName"
+                    )
+                    & ffmpeg $FFArgs | Out-Null
+                    $Index++
+                }
+                Write-Host "Previews generated in 'output' folder." -ForegroundColor Green
+                break # Stop after 1st file
+            }
+            Pause
+        }
 
         # --- SHUTDOWN CHECK ---
-        if ($Choice -match "[1,2,4,5,6]") {
+        if ($Choice -match "[1,2,4,5,6,7]") {
             Enable-SystemSleep
             if ($DoShutdown) {
                 Write-Host "`nSHUTTING DOWN IN 60 SECONDS (CTRL+C to Cancel)." -ForegroundColor Red
