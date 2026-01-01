@@ -1,11 +1,11 @@
 <#
 .SYNOPSIS
-    AV1 Encoder & MKV Muxing Tool (PowerShell v23 - Preview Generator)
+    AV1 Encoder & MKV Muxing Tool (PowerShell v24 - Structure Mirror)
     
     New Feature:
-    - Mode 8: "GENERATE PREVIEWS".
-      - Creates 3x 30-second clips (Start, Middle, End) from the selected file.
-      - Allows you to test if your Grain/CRF settings look good before committing to the full encode.
+    - MIRRORED OUTPUT STRUCTURE:
+      If files are in subfolders inside 'input', the script now creates 
+      the same folder structure inside 'output'.
 #>
 
 # ==================================================
@@ -47,6 +47,10 @@ $Params = [Ordered]@{
 # ==================================================
 $ScriptDir = $PSScriptRoot
 Set-Location -Path $ScriptDir
+
+# Define Input Root explicitly for relative path calculation
+$InputRoot = "$ScriptDir\input" 
+
 $DepPath = Resolve-Path "$ScriptDir\..\..\dependencies" -ErrorAction SilentlyContinue
 
 if ($DepPath -and (Test-Path $DepPath)) {
@@ -67,6 +71,7 @@ if (-not (Test-Path $OutputDir))     { New-Item -ItemType Directory -Force -Path
 # ==================================================
 function Get-FilesRecursive {
     param ($Path)
+    # Recurse through all subfolders
     Get-ChildItem -Path $Path -Recurse -Include *.webm,*.mp4,*.mkv,*.mov,*.avi,*.ts,*.m2t,*.m2ts | 
     Where-Object { $_.FullName -notmatch "completed-inputs" }
 }
@@ -86,8 +91,18 @@ function Get-SmartName {
     }
     
     $FinalName = "$NewName.mkv"
-    if (Test-Path "$OutputDir\$FinalName") { $FinalName = "${NewName}_${QueueNum}.mkv" }
+    # Note: We don't check for existing file here anymore because the target directory changes dynamically.
+    # The overwrite check happens inside the loop now.
     return $FinalName
+}
+
+function Get-TargetDirectory {
+    param ($FileObj)
+    # Calculates the relative path (e.g., "\Season 1") and joins it with OutputDir
+    $RelDir = $FileObj.DirectoryName.Replace($InputRoot, "").Trim("\")
+    $FinalDir = Join-Path $OutputDir $RelDir
+    if (-not (Test-Path $FinalDir)) { New-Item -ItemType Directory -Force -Path $FinalDir | Out-Null }
+    return $FinalDir
 }
 
 function Show-ParamEditor {
@@ -137,7 +152,6 @@ try {
         Write-Host "[6] 2D ANIMATION SPECIAL (Cartoon)"
         Write-Host "[7] 'THE SOPRANOS' SPECIAL (35mm Drama)"
         Write-Host "[8] GENERATE PREVIEWS (Test Settings)"
-        Write-Host "    (Creates 3x 30s clips to check quality)"
         Write-Host ""
         Write-Host "[P] CHANGE PARAMETERS"
         Write-Host "[Q] Quit"
@@ -162,8 +176,12 @@ try {
             $Queue = 1
             foreach ($File in $InputFiles) {
                 $OutputName = Get-SmartName -FileName $File.BaseName -QueueNum $Queue
+                $TargetDir  = Get-TargetDirectory -FileObj $File
+                
                 Write-Host "Processing File $Queue of $Count (CRF)" -ForegroundColor Green
-                $Av1anArgs = @("-i", $File.FullName, "-o", "$OutputDir\$OutputName", "-e", "svt-av1", "-y", "--resume", "--verbose", "-c", "mkvmerge", "-m", "ffms2", "-w", $Params['Workers'], "-a", $Params['Audio'], "-v", "--keyint $($Params['Keyint']) --preset $($Params['Preset']) --crf $($Params['CRF']) --film-grain $($Params['Film Grain'])")
+                Write-Host "Dest: $TargetDir" -ForegroundColor DarkGray
+                
+                $Av1anArgs = @("-i", $File.FullName, "-o", "$TargetDir\$OutputName", "-e", "svt-av1", "-y", "--resume", "--verbose", "-c", "mkvmerge", "-m", "ffms2", "-w", $Params['Workers'], "-a", $Params['Audio'], "-v", "--keyint $($Params['Keyint']) --preset $($Params['Preset']) --crf $($Params['CRF']) --film-grain $($Params['Film Grain'])")
                 & av1an $Av1anArgs
                 if ($LASTEXITCODE -eq 0) { Move-Item -LiteralPath $File.FullName -Destination $CompletedPath -Force }
                 $Queue++
@@ -176,27 +194,31 @@ try {
             $Queue = 1
             foreach ($File in $InputFiles) {
                 $OutputName = Get-SmartName -FileName $File.BaseName -QueueNum $Queue
+                $TargetDir  = Get-TargetDirectory -FileObj $File
+                
                 Write-Host "Processing File $Queue of $Count (SSIMULACRA2)" -ForegroundColor Magenta
-                $Av1anArgs = @("-i", $File.FullName, "-o", "$OutputDir\$OutputName", "-e", "svt-av1", "-y", "--resume", "--verbose", "-c", "mkvmerge", "-m", "ffms2", "-w", $Params['Workers'], "-a", $Params['Audio'], "--target-metric", "ssimulacra2", "--target-quality", $Params['Target Quality'], "-v", "--keyint $($Params['Keyint']) --preset $($Params['Preset']) --film-grain $($Params['Film Grain'])")
+                $Av1anArgs = @("-i", $File.FullName, "-o", "$TargetDir\$OutputName", "-e", "svt-av1", "-y", "--resume", "--verbose", "-c", "mkvmerge", "-m", "ffms2", "-w", $Params['Workers'], "-a", $Params['Audio'], "--target-metric", "ssimulacra2", "--target-quality", $Params['Target Quality'], "-v", "--keyint $($Params['Keyint']) --preset $($Params['Preset']) --film-grain $($Params['Film Grain'])")
                 & av1an $Av1anArgs
                 if ($LASTEXITCODE -eq 0) { Move-Item -LiteralPath $File.FullName -Destination $CompletedPath -Force }
                 $Queue++
             }
         }
         # ------------------------------------
-        # MODE 3: MUXING TOOL (SYNC FIX)
+        # MODE 3: MUXING TOOL
         # ------------------------------------
         elseif ($Choice -eq "3") {
             if ($Count -eq 0) { Write-Host "No files found!"; Pause; continue }
             $FirstFile = $InputFiles[0].FullName
             Write-Host "`nScanning template file: $($InputFiles[0].Name)" -ForegroundColor Yellow
             $JsonInfo = mkvmerge -J $FirstFile | ConvertFrom-Json
+            
             $AudioTracks = $JsonInfo.tracks | Where-Object { $_.type -eq "audio" }
             Write-Host "`n--- AUDIO TRACKS ---" -ForegroundColor Cyan
             if ($AudioTracks) {
                 foreach ($t in $AudioTracks) { Write-Host "ID: $($t.id)".PadRight(10) + "| Lang: $($t.properties.language)".PadRight(15) + "| Codec: $($t.codec)" }
                 $KeepAudio = Read-Host "`nEnter Audio IDs to KEEP (e.g. '0,1' or 'All')"
             }
+
             $SubTracks = $JsonInfo.tracks | Where-Object { $_.type -eq "subtitles" }
             Write-Host "`n--- SUBTITLE TRACKS ---" -ForegroundColor Cyan
             if ($SubTracks) {
@@ -206,35 +228,49 @@ try {
                 }
                 $KeepSubs = Read-Host "`nEnter Subtitle IDs to KEEP (e.g. '2' or 'All')"
             }
+            
             $DelayMs = Read-Host "`nEnter Subtitle Delay in ms (e.g. 200 to delay, -200 to speed up)"
+
             foreach ($File in $InputFiles) {
                 $OutputName = $File.BaseName + " [Muxed].mkv"
-                $OutPath = "$OutputDir\$OutputName"
+                $TargetDir  = Get-TargetDirectory -FileObj $File
+                
                 Write-Host "Muxing: $($File.Name)" -ForegroundColor Green
-                $CmdArgs = @("-o", $OutPath)
+                
+                $CmdArgs = @("-o", "$TargetDir\$OutputName")
                 if ($KeepAudio -ne "All" -and $KeepAudio -ne "" -and $KeepAudio -ne "A") { $CmdArgs += "--audio-tracks"; $CmdArgs += $KeepAudio }
-                if ($KeepSubs -eq "None") { $CmdArgs += "--no-subtitles" } elseif ($KeepSubs -ne "All" -and $KeepSubs -ne "" -and $KeepSubs -ne "A") { $CmdArgs += "--subtitle-tracks"; $CmdArgs += $KeepSubs }
+                
+                if ($KeepSubs -eq "None") { 
+                    $CmdArgs += "--no-subtitles" 
+                } elseif ($KeepSubs -ne "All" -and $KeepSubs -ne "" -and $KeepSubs -ne "A") { 
+                    $CmdArgs += "--subtitle-tracks"; $CmdArgs += $KeepSubs 
+                }
+
                 if ($DelayMs -match "^-?\d+$" -and $DelayMs -ne "0") {
                     if ($KeepSubs -ne "All" -and $KeepSubs -ne "A" -and $KeepSubs -ne "") {
                         $SubList = $KeepSubs -split ","
                         foreach ($sid in $SubList) { $CmdArgs += "--sync"; $CmdArgs += "$($sid):$DelayMs" }
-                    } else { foreach ($t in $SubTracks) { $CmdArgs += "--sync"; $CmdArgs += "$($t.id):$DelayMs" } }
+                    } else {
+                        foreach ($t in $SubTracks) { $CmdArgs += "--sync"; $CmdArgs += "$($t.id):$DelayMs" }
+                    }
                 }
+
                 $CmdArgs += $File.FullName
                 & mkvmerge $CmdArgs | Out-Null
                 if ($LASTEXITCODE -eq 0) { Move-Item -LiteralPath $File.FullName -Destination $CompletedPath -Force }
             }
         }
         # ------------------------------------
-        # MODE 4: THE WIRE (FULL VIDEO)
+        # MODE 4: THE WIRE
         # ------------------------------------
         elseif ($Choice -eq "4") {
             $Queue = 1
             foreach ($File in $InputFiles) {
                 $OutputName = Get-SmartName -FileName $File.BaseName -QueueNum $Queue
+                $TargetDir  = Get-TargetDirectory -FileObj $File
                 Write-Host "Processing File $Queue of $Count (The Wire)" -ForegroundColor Yellow
                 $AudioCmd = "-c:a libopus -b:a 128k -ac 2 -af `"aresample=matrix_encoding=dplii`""
-                $Av1anArgs = @("-i", $File.FullName, "-o", "$OutputDir\$OutputName", "-e", "svt-av1", "-y", "--resume", "--verbose", "-c", "mkvmerge", "-m", "ffms2", "-w", "2", "-a", $AudioCmd, "-v", "--keyint 240 --preset 4 --crf 27 --film-grain 12")
+                $Av1anArgs = @("-i", $File.FullName, "-o", "$TargetDir\$OutputName", "-e", "svt-av1", "-y", "--resume", "--verbose", "-c", "mkvmerge", "-m", "ffms2", "-w", "2", "-a", $AudioCmd, "-v", "--keyint 240 --preset 4 --crf 27 --film-grain 12")
                 & av1an $Av1anArgs
                 if ($LASTEXITCODE -eq 0) { Move-Item -LiteralPath $File.FullName -Destination $CompletedPath -Force }
                 $Queue++
@@ -247,8 +283,9 @@ try {
             $Queue = 1
             foreach ($File in $InputFiles) {
                 $OutputName = Get-SmartName -FileName $File.BaseName -QueueNum $Queue -AudioOnly $true
+                $TargetDir  = Get-TargetDirectory -FileObj $File
                 Write-Host "Processing File $Queue of $Count (Audio Only)" -ForegroundColor Cyan
-                $FFArgs = @("-y", "-i", $File.FullName, "-map", "0", "-c:v", "copy", "-c:s", "copy", "-c:a", "libopus", "-b:a", "128k", "-ac", "2", "-af", "aresample=matrix_encoding=dplii", "-metadata:s:a", "title=", "$OutputDir\$OutputName")
+                $FFArgs = @("-y", "-i", $File.FullName, "-map", "0", "-c:v", "copy", "-c:s", "copy", "-c:a", "libopus", "-b:a", "128k", "-ac", "2", "-af", "aresample=matrix_encoding=dplii", "-metadata:s:a", "title=", "$TargetDir\$OutputName")
                 & ffmpeg $FFArgs
                 if ($LASTEXITCODE -eq 0) { Move-Item -LiteralPath $File.FullName -Destination $CompletedPath -Force } else { Write-Host "Conversion failed!" -ForegroundColor Red; Pause; break }
                 $Queue++
@@ -261,9 +298,10 @@ try {
             $Queue = 1
             foreach ($File in $InputFiles) {
                 $OutputName = Get-SmartName -FileName $File.BaseName -QueueNum $Queue
+                $TargetDir  = Get-TargetDirectory -FileObj $File
                 Write-Host "Processing File $Queue of $Count (Mode: CARTOON)" -ForegroundColor Yellow
                 $AudioCmd = "-c:a libopus -b:a 96k -ac 2"
-                $Av1anArgs = @("-i", $File.FullName, "-o", "$OutputDir\$OutputName", "-e", "svt-av1", "-y", "--resume", "--verbose", "-c", "mkvmerge", "-m", "ffms2", "-w", $Params['Workers'], "-a", $AudioCmd, "-v", "--keyint 240 --preset 6 --crf 30 --film-grain 0")
+                $Av1anArgs = @("-i", $File.FullName, "-o", "$TargetDir\$OutputName", "-e", "svt-av1", "-y", "--resume", "--verbose", "-c", "mkvmerge", "-m", "ffms2", "-w", $Params['Workers'], "-a", $AudioCmd, "-v", "--keyint 240 --preset 6 --crf 30 --film-grain 0")
                 & av1an $Av1anArgs
                 if ($LASTEXITCODE -eq 0) { Move-Item -LiteralPath $File.FullName -Destination $CompletedPath -Force } else { Write-Host "Encoding failed!" -ForegroundColor Red; Pause; break }
                 $Queue++
@@ -276,9 +314,10 @@ try {
             $Queue = 1
             foreach ($File in $InputFiles) {
                 $OutputName = Get-SmartName -FileName $File.BaseName -QueueNum $Queue
+                $TargetDir  = Get-TargetDirectory -FileObj $File
                 Write-Host "Processing File $Queue of $Count (Mode: SOPRANOS)" -ForegroundColor Yellow
                 $AudioCmd = "-c:a libopus -b:a 128k -ac 2 -af `"aresample=matrix_encoding=dplii`""
-                $Av1anArgs = @("-i", $File.FullName, "-o", "$OutputDir\$OutputName", "-e", "svt-av1", "-y", "--resume", "--verbose", "-c", "mkvmerge", "-m", "ffms2", "-w", $Params['Workers'], "-a", $AudioCmd, "-v", "--keyint 240 --preset 4 --crf 25 --film-grain 10")
+                $Av1anArgs = @("-i", $File.FullName, "-o", "$TargetDir\$OutputName", "-e", "svt-av1", "-y", "--resume", "--verbose", "-c", "mkvmerge", "-m", "ffms2", "-w", $Params['Workers'], "-a", $AudioCmd, "-v", "--keyint 240 --preset 4 --crf 25 --film-grain 10")
                 & av1an $Av1anArgs
                 if ($LASTEXITCODE -eq 0) { Move-Item -LiteralPath $File.FullName -Destination $CompletedPath -Force } else { Write-Host "Encoding failed!" -ForegroundColor Red; Pause; break }
                 $Queue++
@@ -289,43 +328,23 @@ try {
         # ------------------------------------
         elseif ($Choice -eq "8") {
             if ($Count -eq 0) { Write-Host "No files found!"; Pause; continue }
-            
-            # Ask which settings to use for the test
             Write-Host "`n--- PREVIEW SETTINGS ---" -ForegroundColor Yellow
-            $TestCRF   = Read-Host "Enter CRF to test (Default: 24)"
-            if ($TestCRF -eq "") { $TestCRF = "24" }
-            $TestGrain = Read-Host "Enter Film Grain to test (Default: 0)"
-            if ($TestGrain -eq "") { $TestGrain = "0" }
-            $TestPreset = Read-Host "Enter Preset (Default: 6)"
-            if ($TestPreset -eq "") { $TestPreset = "6" }
-
-            $Queue = 1
+            $TestCRF = Read-Host "Enter CRF (Default: 24)"; if ($TestCRF -eq "") { $TestCRF = "24" }
+            $TestGrain = Read-Host "Enter Grain (Default: 0)"; if ($TestGrain -eq "") { $TestGrain = "0" }
+            
             foreach ($File in $InputFiles) {
-                # We only process the FIRST file in the list for previews to save time,
-                # unless you want to loop all. usually 1 is enough to test settings.
                 Write-Host "Generating Previews for: $($File.Name)" -ForegroundColor Cyan
-                
-                # Define 3 timestamps: Start (00:02:00), Middle, End
+                # Previews still go to root output for easy checking
                 $Timestamps = @("00:02:00", "00:20:00", "00:40:00")
                 $Index = 1
-
                 foreach ($Time in $Timestamps) {
                     $PrevName = "PREVIEW_${Index}_" + $File.BaseName + ".mkv"
-                    Write-Host "  -> Clip $Index ($Time)..." -ForegroundColor DarkGray
-                    
-                    # FFmpeg command to cut 30s and encode immediately using SVT-AV1 via ffmpeg directly (faster for previews)
-                    # Note: We use FFmpeg libsvtav1 here for speed/simplicity in preview mode.
-                    $FFArgs = @(
-                        "-y", "-ss", $Time, "-t", "30", "-i", $File.FullName,
-                        "-c:v", "libsvtav1", "-preset", $TestPreset, "-crf", $TestCRF, "-svtav1-params", "film-grain=$TestGrain",
-                        "-c:a", "libopus", "-b:a", "96k",
-                        "$OutputDir\$PrevName"
-                    )
+                    $FFArgs = @("-y", "-ss", $Time, "-t", "30", "-i", $File.FullName, "-c:v", "libsvtav1", "-preset", "6", "-crf", $TestCRF, "-svtav1-params", "film-grain=$TestGrain", "-c:a", "libopus", "-b:a", "96k", "$OutputDir\$PrevName")
                     & ffmpeg $FFArgs | Out-Null
                     $Index++
                 }
                 Write-Host "Previews generated in 'output' folder." -ForegroundColor Green
-                break # Stop after 1st file
+                break
             }
             Pause
         }
