@@ -1,12 +1,11 @@
 <#
 .SYNOPSIS
-    AV1 Encoder & MKV Muxing Tool (PowerShell v25 - Clean Menu)
+    AV1 Encoder & MKV Muxing Tool (PowerShell v29 - Native Fix)
     
-    Update:
-    - Reordered Menu: 
-      - 1-5: Video Encoding Modes (General -> Specific)
-      - 6-8: Tools (Audio, Muxing, Previews)
-    - All functionality preserved.
+    Fixes:
+    - Simplified folder creation logic using native PowerShell features.
+    - Uses 'Test-Path -LiteralPath' to prevent crashes on brackets [].
+    - Uses 'New-Item -Force' to auto-create parent directories without complex loops.
 #>
 
 # ==================================================
@@ -48,8 +47,6 @@ $Params = [Ordered]@{
 # ==================================================
 $ScriptDir = $PSScriptRoot
 Set-Location -Path $ScriptDir
-
-# Define Input Root explicitly for relative path calculation
 $InputRoot = "$ScriptDir\input" 
 
 $DepPath = Resolve-Path "$ScriptDir\..\..\dependencies" -ErrorAction SilentlyContinue
@@ -64,8 +61,10 @@ if (Test-Path $VsPath) { $Env:PATH = "$VsPath;$Env:PATH" }
 
 $CompletedPath = "$ScriptDir\input\completed-inputs"
 $OutputDir     = "$ScriptDir\output"
-if (-not (Test-Path $CompletedPath)) { New-Item -ItemType Directory -Force -Path $CompletedPath | Out-Null }
-if (-not (Test-Path $OutputDir))     { New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null }
+
+# Ensure base folders exist (using simple -Force creation)
+if (-not (Test-Path -LiteralPath $CompletedPath)) { New-Item -Path $CompletedPath -ItemType Directory -Force | Out-Null }
+if (-not (Test-Path -LiteralPath $OutputDir))     { New-Item -Path $OutputDir -ItemType Directory -Force | Out-Null }
 
 # ==================================================
 # HELPER FUNCTIONS
@@ -89,16 +88,27 @@ function Get-SmartName {
                              -replace "AC3","Opus" -replace "DD","Opus"
         if ($NewName -notmatch "AV1") { $NewName = "$NewName [AV1]" }
     }
-    
-    $FinalName = "$NewName.mkv"
-    return $FinalName
+    return "$NewName.mkv"
 }
 
+# --- NEW OPTIMIZED FUNCTION ---
 function Get-TargetDirectory {
     param ($FileObj)
+    
+    # Calculate relative path (e.g. "\Season 1\[Arid] Folder")
     $RelDir = $FileObj.DirectoryName.Replace($InputRoot, "").Trim("\")
+    
+    # Combine with Output Root
     $FinalDir = Join-Path $OutputDir $RelDir
-    if (-not (Test-Path $FinalDir)) { New-Item -ItemType Directory -Force -Path $FinalDir | Out-Null }
+    
+    # THE FIX: 
+    # 1. Test-Path MUST use -LiteralPath to avoid crashing on brackets [].
+    # 2. New-Item -Force automatically creates the full tree (parents included).
+    # 3. New-Item uses -Path (which handles creation names literally in this context).
+    if (-not (Test-Path -LiteralPath $FinalDir)) {
+        New-Item -Path $FinalDir -ItemType Directory -Force | Out-Null
+    }
+    
     return $FinalDir
 }
 
@@ -200,7 +210,7 @@ try {
             }
         }
         # ------------------------------------
-        # [3] 2D ANIMATION (CARTOON)
+        # [3] 2D ANIMATION
         # ------------------------------------
         elseif ($Choice -eq "3") {
             $Queue = 1
@@ -319,6 +329,7 @@ try {
                 $Index = 1
                 foreach ($Time in $Timestamps) {
                     $PrevName = "PREVIEW_${Index}_" + $File.BaseName + ".mkv"
+                    # Previews go to output root, not subfolder, for easier access
                     $FFArgs = @("-y", "-ss", $Time, "-t", "30", "-i", $File.FullName, "-c:v", "libsvtav1", "-preset", "6", "-crf", $TestCRF, "-svtav1-params", "film-grain=$TestGrain", "-c:a", "libopus", "-b:a", "96k", "$OutputDir\$PrevName")
                     & ffmpeg $FFArgs | Out-Null
                     $Index++
