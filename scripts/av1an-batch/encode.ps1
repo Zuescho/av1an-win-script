@@ -59,12 +59,18 @@ if ($DepPath -and (Test-Path $DepPath)) {
 $VsPath = "$DepPath\vapoursynth64\Lib\site-packages"
 if (Test-Path $VsPath) { $Env:PATH = "$VsPath;$Env:PATH" }
 
-$CompletedPath = "$ScriptDir\input\completed-inputs"
-$OutputDir     = "$ScriptDir\output"
+$CompletedPath    = "$ScriptDir\input\completed-inputs"
+$OutputDir        = "$ScriptDir\output"
+$WebmInputDir     = "$ScriptDir\webm-converter"
+$WebmOutputDir    = "$ScriptDir\webm-converter\output"
+$WebmCompletedDir = "$ScriptDir\webm-converter\completed-inputs"
 
 # Ensure base folders exist (using simple -Force creation)
-if (-not (Test-Path -LiteralPath $CompletedPath)) { New-Item -Path $CompletedPath -ItemType Directory -Force | Out-Null }
-if (-not (Test-Path -LiteralPath $OutputDir))     { New-Item -Path $OutputDir -ItemType Directory -Force | Out-Null }
+if (-not (Test-Path -LiteralPath $CompletedPath))    { New-Item -Path $CompletedPath    -ItemType Directory -Force | Out-Null }
+if (-not (Test-Path -LiteralPath $OutputDir))        { New-Item -Path $OutputDir        -ItemType Directory -Force | Out-Null }
+if (-not (Test-Path -LiteralPath $WebmInputDir))     { New-Item -Path $WebmInputDir     -ItemType Directory -Force | Out-Null }
+if (-not (Test-Path -LiteralPath $WebmOutputDir))    { New-Item -Path $WebmOutputDir    -ItemType Directory -Force | Out-Null }
+if (-not (Test-Path -LiteralPath $WebmCompletedDir)) { New-Item -Path $WebmCompletedDir -ItemType Directory -Force | Out-Null }
 
 # ==================================================
 # HELPER FUNCTIONS
@@ -145,6 +151,8 @@ try {
         Clear-Host
         $InputFiles = @(Get-FilesRecursive "input")
         $Count = $InputFiles.Count
+        $WebmFiles = @(Get-ChildItem -Path $WebmInputDir -Recurse -Include *.webm,*.mp4,*.mkv,*.mov,*.avi,*.ts,*.m2t,*.m2ts -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch "completed-inputs|\\output" })
+        $WebmCount = $WebmFiles.Count
 
         Write-Host "==================================================" -ForegroundColor Cyan
         Write-Host "       AV1 ENCODER & MKV TOOL (PowerShell)" -ForegroundColor Cyan
@@ -162,6 +170,7 @@ try {
         Write-Host "[6] AUDIO CONVERT ONLY (Opus Stereo)"
         Write-Host "[7] MUXING TOOL (Remux, Sync Fix)"
         Write-Host "[8] GENERATE PREVIEWS (Test Settings)"
+        Write-Host "[9] MP4 TO WEBM (Max Size) [$WebmCount files]"
         Write-Host ""
         Write-Host "[P] CHANGE PARAMETERS"
         Write-Host "[Q] Quit"
@@ -172,10 +181,12 @@ try {
         if ($Choice -eq "P" -or $Choice -eq "p") { Show-ParamEditor }
 
         # --- SHUTDOWN LOGIC ---
-        if ($Choice -match "[1-8]") {
-            if ($Count -eq 0) { Write-Host "No files found!"; Pause; continue }
-            $ShutdownAns = Read-Host "`nShutdown PC after finishing? (Y/N)"
-            $DoShutdown = ($ShutdownAns -eq "Y" -or $ShutdownAns -eq "y")
+        if ($Choice -match "[1-9]") {
+            if ($Count -eq 0 -and $Choice -ne "9") { Write-Host "No files found!"; Pause; continue }
+            if ($Choice -ne "9") {
+                $ShutdownAns = Read-Host "`nShutdown PC after finishing? (Y/N)"
+                $DoShutdown = ($ShutdownAns -eq "Y" -or $ShutdownAns -eq "y")
+            }
             Disable-SystemSleep
         }
 
@@ -338,6 +349,62 @@ try {
                 break
             }
             Pause
+        }
+
+        # ------------------------------------
+        # [9] MP4 TO WEBM (Max Size)
+        # ------------------------------------
+        elseif ($Choice -eq "9") {
+            if ($WebmCount -eq 0) { Write-Host "No files found in webm-converter folder!"; Pause; continue }
+            $MaxSizeMBStr = Read-Host "`nEnter max output size in MB (e.g. 25)"
+            $MaxSizeMB = [double]$MaxSizeMBStr
+            $AudioBitrateK = 128
+            $Queue = 1
+
+            foreach ($File in $WebmFiles) {
+                $OutputName = $File.BaseName + " [VP9].webm"
+                $OutputPath = "$WebmOutputDir\$OutputName"
+                $PassLog    = "$env:TEMP\ffpass_$($File.BaseName -replace '[^\w]','_')"
+
+                Write-Host "Processing File $Queue of $WebmCount (WebM VP9)" -ForegroundColor Cyan
+
+                $DurArgs = @("-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", $File.FullName)
+                $Duration = [double](& ffprobe $DurArgs 2>$null)
+
+                if ($Duration -le 0) {
+                    Write-Host "Could not determine duration, skipping: $($File.Name)" -ForegroundColor Red
+                    $Queue++
+                    continue
+                }
+
+                $VideoBitrateK = [int](($MaxSizeMB * 8192 - $AudioBitrateK * $Duration) / $Duration)
+                if ($VideoBitrateK -lt 100) { $VideoBitrateK = 100 }
+
+                $SourceSizeMB = [math]::Round($File.Length / 1MB, 1)
+                if ($SourceSizeMB -le $MaxSizeMB) {
+                    Write-Host "  Source is $SourceSizeMB MB (already under target). Capping bitrate at source level." -ForegroundColor Yellow
+                    $SrcBrArgs = @("-v", "error", "-select_streams", "v:0", "-show_entries", "stream=bit_rate", "-of", "default=noprint_wrappers=1:nokey=1", $File.FullName)
+                    $SrcVideoBitrateK = [int]([double](& ffprobe $SrcBrArgs 2>$null) / 1000)
+                    if ($SrcVideoBitrateK -gt 0) { $VideoBitrateK = $SrcVideoBitrateK }
+                }
+
+                Write-Host "  Duration: $([math]::Round($Duration,1))s | Target video bitrate: ${VideoBitrateK}k" -ForegroundColor DarkGray
+
+                $Pass1Args = @("-y", "-i", $File.FullName, "-c:v", "libvpx-vp9", "-b:v", "${VideoBitrateK}k", "-cpu-used", "2", "-row-mt", "1", "-pass", "1", "-passlogfile", $PassLog, "-an", "-f", "null", "NUL")
+                & ffmpeg $Pass1Args
+
+                $Pass2Args = @("-y", "-i", $File.FullName, "-c:v", "libvpx-vp9", "-b:v", "${VideoBitrateK}k", "-cpu-used", "2", "-row-mt", "1", "-pass", "2", "-passlogfile", $PassLog, "-c:a", "libopus", "-b:a", "${AudioBitrateK}k", "-ac", "2", $OutputPath)
+                & ffmpeg $Pass2Args
+
+                if ($LASTEXITCODE -eq 0) {
+                    Move-Item -LiteralPath $File.FullName -Destination $WebmCompletedDir -Force
+                } else {
+                    Write-Host "Conversion failed!" -ForegroundColor Red
+                    Pause
+                    break
+                }
+                $Queue++
+            }
         }
 
         # --- SHUTDOWN CHECK ---
